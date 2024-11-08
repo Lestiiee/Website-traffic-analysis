@@ -1,0 +1,434 @@
+---
+author: Celestie Okechukwu
+title: Website traffic analysis and Stack overflow use trend analysis
+date: 10/26/2024
+format:
+  pdf:
+    documentclass: article
+    geometry: 'left=2cm, right=2cm, top=2cm, bottom=2cm'
+jupyter: python3
+---
+```{python}
+#| eval: false
+
+cp -r /scratch/users/paciorek/wikistats/dated_2017_small /tmp/
+
+import dask
+import dask.dataframe as dd
+import pandas as pd
+import os
+import csv
+dask.config.set(scheduler='processes', num_workers=4, chunksize=1)
+
+@dask.delayed
+
+def read_and_filter(file_path):
+    # Set dtype for the first two columns, allowing python to infer for other columns
+    dtype = {0: str, 1: str}
+    
+    # Read in the file 
+    df = pd.read_csv(
+        file_path, 
+        sep=r'\s+', 
+        header=None, 
+        dtype=dtype,
+        compression='gzip',
+        quoting=csv.QUOTE_NONE
+    )
+
+    filtered_df = df[df[3].str.contains("Barack_Obama", na=False)]
+    return filtered_df
+
+data_dir = '/tmp/dated_2017_small/dated/'
+file_paths = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.gz')]
+# file_paths = file_paths[:10]
+
+tasks = [read_and_filter(file_path) for file_path in file_paths]
+
+filtered_dfs = dask.compute(*tasks)
+combined_df = pd.concat(filtered_dfs, ignore_index=True)
+
+# Time-series plot of result - showing how the visits varied throughout the day
+import pandas as pd
+
+# Combine date and time strings into a single datetime string
+combined_df['datetime_str'] = combined_df[0] + ' ' + combined_df[1]
+
+# Convert to a datetime object with the specified format for both date and time
+combined_df['datetime_temp'] = pd.to_datetime(combined_df['datetime_str'], format="%Y%m%d %H%M%S")
+
+# Extract the hour from datetime_temp for grouping and summing values
+combined_df['hour'] = combined_df['datetime_temp'].dt.hour
+hourly_totals = combined_df.groupby('hour')[5].sum()
+
+# Plot the result
+hourly_totals.plot(kind='bar', figsize=(10, 6), xlabel="Hour of the Day",\ 
+ylabel="Total Value", title="Total visits for Each Hour of the Day")
+
+# Save the plot to a file
+plt.savefig("hourly_totals_plot.pdf")
+
+
+exit()
+
+rm -r /tmp/dated_2017_small/
+```
+
+python script:
+
+```{python}
+#| eval: false
+
+import dask
+import dask.dataframe as dd
+import pandas as pd
+import os
+
+dask.config.set(scheduler='processes', num_workers=4, chunksize=1)
+
+@dask.delayed
+def read_and_filter(file_path):
+    # Read the file into a Pandas DataFrame
+    df = pd.read_csv(file_path, sep=r'\s+', header=None, compression='gzip')
+
+    # Filter rows where "Barack_Obama" appears in column 4 (index 3)
+    filtered_df = df[df[3].str.contains("Barack_Obama", na=False)]
+    return filtered_df
+
+
+# Main function to process multiple files in parallel
+def main(data_dir, num_files=10):
+    data_directory = '/tmp/dated_2017_small/dated/'
+
+    # List all space-delimited .gz files in the directory
+    file_paths = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.gz')]
+    
+    # Limit to the first `num_files` .gz files for testing
+    file_paths = file_paths[:num_files]
+
+    # Create a list of delayed tasks for reading and filtering each file
+    tasks = [read_and_filter(file_path) for file_path in file_paths]
+
+    # Compute all tasks in parallel and collate the results into a single DataFrame
+    filtered_dfs = dask.compute(*tasks)
+    combined_df = pd.concat(filtered_dfs, ignore_index=True)
+
+    # Print the combined DataFrame's first few rows as a check
+    print(combined_df.head())
+
+
+if __name__ == '__main__':
+    # Update the path to the correct directory containing the data files
+    data_directory = '../tmp/dated_2017_small/dated/'
+    main(data_directory)
+
+```
+
+Sbatch submission script:
+
+```{bash}
+#| eval: false
+
+#!/bin/bash
+#SBATCH --job-name=obama_analysis
+#SBATCH --partition=low
+#SBATCH --output=ex.out                 # Output file
+#SBATCH --error=error.err              # Error file
+#SBATCH --ntasks=1                     # Number of tasks (processes)
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=8              # Number of cores per task
+#SBATCH --time=08:00:00                # Time limit
+#SBATCH --mem=4G                       # Memory limit (4 GB)
+
+# Define source and temporary directory paths
+SOURCE_DIR="/scratch/users/paciorek/wikistats/dated_2017_small/dated"
+TMP_DIR="/tmp/obama_analysis_$SLURM_JOB_ID"  # Unique tmp directory using job ID
+
+# Create a temporary directory
+mkdir -p $TMP_DIR
+
+# Copy data files from source to the temporary directory
+cp $SOURCE_DIR/*.gz $TMP_DIR
+
+# Run the Python script and capture the output
+PYTHON_OUTPUT=$(python /accounts/grad/lestiekayh/obama-analysis.py "$TMP_DIR")
+
+# Append the Python output to analysis-output.txt using co-output.sh
+bash co-output.sh "$PYTHON_OUTPUT"
+
+# Remove the temporary directory
+rm -rf $TMP_DIR
+echo "Temporary directory $TMP_DIR removed."
+```
+
+python script to read and filter data:
+
+```{python}
+#| eval: false
+import dask
+import dask.bag as db
+import dask.dataframe as dd
+import os
+import csv
+import pandas as pd
+import sys
+
+def main(output_dir):
+    # Set Dask configuration for parallel processing
+    dask.config.set(scheduler='processes', num_workers=8, chunksize=1)
+
+    # Define the path to the directory containing the data files
+    data_dir = '/var/local/s243/wikistats/dated_2017_sub'
+    file_paths = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.gz')]
+    
+    # Optional -Limit to processing only the first 10 files for test purposes
+    #file_paths = file_paths[:10]
+    
+    # Define a function to read and filter each file by line
+    def read_and_filter(line):
+        # Use csv.reader to handle the whitespace-separated columns
+        reader = csv.reader([line], delimiter=' ', quoting=csv.QUOTE_NONE)
+        row = next(reader)
+        if len(row) > 3 and "Barack_Obama" in row[3]:  # Adjust index if needed
+            return row
+        return None
+    
+    # Load all files into a Dask Bag, read them line by line, and filter them
+    bag = db.read_text(file_paths, compression='gzip') \
+        .map(read_and_filter) \
+        .filter(lambda x: x is not None)
+    
+    # Convert the bag to a Dask DataFrame with specified data types
+    df = bag.to_dataframe(meta={0: str, 1: str, 2: str, 3: str, 4: float, 5: float})
+
+    df_computed = df.compute()
+    df_computed[3]=df_computed[3].astype(str)
+    output_path = os.path.join(output_dir, 'combined_data_full.parquet')
+    df_computed.to_parquet(output_path, index=False)
+    print(f"Data saved to {output_path}")
+
+if __name__ == '__main__':
+    output_dir = sys.argv[1]
+    main(output_dir)
+```
+
+sbatch for job processing script:
+
+```{bash}
+#| eval: false
+
+#!/bin/bash
+#SBATCH --job-name=q2_analysis
+#SBATCH --partition=low
+#SBATCH --output=ex.out                 # Output file
+#SBATCH --error=error.err              # Error file
+#SBATCH --ntasks=1                     # Number of tasks (processes)
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=8              # Number of cores per task
+#SBATCH --time=08:00:00                # Time limit
+#SBATCH --mem=4G                       # Memory limit (4 GB)
+
+# Define the data source directory path
+SOURCE_DIR="/var/local/s243/wikistats/dated_2017_sub"
+
+# Define the output directory path
+OUTPUT_DIR="/accounts/grad/lestiekayh"
+echo "Output will be saved to $OUTPUT_DIR"
+
+# Run the Python script and capture the total processing time and output 
+time python /accounts/grad/lestiekayh/q2-analysis.py $OUTPUT_DIR
+```
+
+```{python}
+#| eval: false
+
+# Show output from dask parallelization (test result and full run showed the same output): 
+import pandas as pd
+file_path = '/accounts/grad/lestiekayh/combined_data_full.parquet'
+df = pd.read_parquet(file_path)
+print(df.head())
+```
+```{python}
+import pandas as pd
+
+# Load the data
+df = pd.read_parquet('combined_data_full.parquet')
+
+# Combine the '0' (day) and '1' (time) columns, parse them as datetime, 
+# Assign to a new 'day_hour' column
+df['day_hour'] = pd.to_datetime(df['0'] + df['1'], format='%Y%m%d%H%M%S')
+
+# Group by the new 'day_hour' column
+grouped_df = df.groupby('day_hour').sum(numeric_only=True)  # Sum numeric columns
+
+# Save the grouped DataFrame to a new Parquet file
+grouped_df.to_parquet('grouped_data_by_day_hour.parquet')
+
+print("Data grouped by day-hour and saved to 'grouped_data_by_day_hour.parquet'.")
+```
+
+```{python}
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# Plot the time series for column '5' in the grouped data (traffic count) 
+plt.figure(figsize=(12, 6))
+plt.plot(grouped_df.index, grouped_df['5'], label='Column 5')
+
+# Add labels and title
+plt.xlabel('Date')
+plt.ylabel('Sum')
+plt.title('Traffic variation by day for 10/17-11/17 2008')
+plt.xticks(rotation=45)
+plt.tight_layout()
+
+plt.show()
+```
+
+```{python}
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# Filter the data for November 3-5, 2008
+start_date = pd.Timestamp('2008-11-03 00:00:00')
+end_date = pd.Timestamp('2008-11-05 23:59:59')
+filtered_df = grouped_df[(grouped_df.index >= start_date) & (grouped_df.index <= end_date)]
+
+# Plot the filtered time series
+plt.figure(figsize=(12, 6))
+plt.plot(filtered_df.index, filtered_df['5'], label='Column 5')
+
+# Add labels and title
+plt.xlabel('Day and Time')
+plt.ylabel('Sum')
+plt.title('Traffic variation for November 3-5, 2008')
+plt.xticks(rotation=45)
+plt.tight_layout()
+
+plt.show()
+```
+
+# Stack overflow data processing and analysis using SQL within python in Jupyter notebook
+ 
+```{python}
+#| eval: false
+
+# Create views to remove any rows where ownerid is NULL in the questions and answers tables
+import os
+import sqlite3 as sq
+con = sq.connect('/Users/lestie/Downloads/stackoverflow-2021.db')
+db = con.cursor()
+db.execute("CREATE VIEW valid_questions AS SELECT * FROM questions WHERE ownerid IS NOT NULL;") 
+db.execute("CREATE VIEW valid_answers AS SELECT * FROM answers WHERE ownerid IS NOT NULL;")
+db.fetchall()
+
+# Query the view and fetch the results
+db.execute("SELECT * FROM valid_questions LIMIT 10;")
+rows = db.fetchall()
+
+# Print the results
+for row in rows:
+    print(row)
+```
+
+```{python}
+#| eval: false
+# Example using a subquery in the WHERE clause to find users 
+# who have asked at least one question but never answered any
+query0 = """
+SELECT COUNT(*)
+FROM users u
+WHERE u.userid IN (
+    SELECT q.ownerid
+    FROM valid_questions q
+)
+AND u.userid NOT IN (
+    SELECT a.ownerid
+    FROM valid_answers a
+);
+"""
+# Query the view and fetch the results
+db.execute("query0")
+rows = db.fetchall()
+
+# Print the results
+for row in rows:
+    print(row)
+```
+
+Generated output:
+(512091)
+
+```{python}
+#| eval: false
+
+#  Using a subquery in the FROM clause
+query1 = """
+SELECT COUNT(*)
+FROM (
+    SELECT u.userid, u.displayname
+    FROM users u
+    JOIN valid_questions q ON u.userid = q.ownerid
+) AS q_users
+LEFT JOIN valid_answers a ON q_users.userid = a.ownerid
+WHERE a.ownerid IS NULL;
+"""
+
+# Query the view and fetch the results
+db.execute(query1)
+results = db.fetchall()
+
+for row in results:
+    print(row)
+```
+
+Generated output:
+(512091)
+
+```{python}
+#| eval: false
+# Example using a set operation (EXCEPT)
+query2 = """
+SELECT COUNT(*) FROM (
+    SELECT u.userid
+    FROM users u
+    WHERE u.userid IN (
+        SELECT q.ownerid FROM valid_questions q
+        EXCEPT
+        SELECT a.ownerid FROM valid_answers a
+    )
+);
+"""
+# Query the view and fetch the results
+db.execute(query2)
+results2 = db.fetchall()
+
+for row in results2:
+    print(row)
+```
+
+Generated output:
+(512091)
+
+```{python}
+#| eval: false
+# Example using a left outer join
+query3 = """
+SELECT COUNT(*)
+FROM users u
+LEFT JOIN valid_questions q ON u.userid = q.ownerid
+LEFT JOIN valid_answers a ON u.userid = a.ownerid
+WHERE q.ownerid IS NOT NULL
+AND a.ownerid IS NULL;
+"""
+
+# Query the view and fetch the results
+db.execute(query3)
+results3 = db.fetchall()
+
+for row in results3:
+    print(row)
+```
+
+Generated output:
+(512091)
